@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# Host wrapper: run the baked `q2` against files in the current directory.
+#
+#   q2 render doc.qmd     -> docker run ... q2 render doc.qmd  (cwd mounted)
+#   q2 --version
+#
+# The current working directory is bind-mounted at /work, so q2 reads and
+# writes host files, and outputs are owned by the calling user.
+#
+# Before running, if upstream q2 has moved since the image was built, offer to
+# rebuild (interactive TTY only). The remote lookup is cached, so this costs a
+# network round trip once a day at most. Skip the check with
+# Q2_NO_UPDATE_CHECK=1.
+set -euo pipefail
+
+# Resolve the symlink chain: this script is usually invoked through a symlink
+# in ~/.local/bin, and q2-image lives next to the real file, not next to the link.
+source_path="${BASH_SOURCE[0]}"
+while [ -L "$source_path" ]; do
+  link_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  source_path="$(readlink "$source_path")"
+  [ "${source_path#/}" = "$source_path" ] && source_path="$link_dir/$source_path"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$source_path")" && pwd)"
+IMAGE="${Q2_IMAGE:-quarto-dev/q2:latest}"
+
+if [ -z "${Q2_NO_UPDATE_CHECK:-}" ] && [ -t 0 ] && [ -t 2 ]; then
+  check_status=0
+  Q2_IMAGE="$IMAGE" "$SCRIPT_DIR/q2-image" check --quiet >/dev/null 2>&1 || check_status=$?
+  if [ "$check_status" -eq 3 ]; then
+    printf 'q2: upstream q2 changed since image build. Rebuild now? [y/N] ' >&2
+    read -r ans
+    case "$ans" in
+      [Yy]*) "$SCRIPT_DIR/q2-image" build ;;
+      *) echo "q2: running existing image (may be stale)." >&2 ;;
+    esac
+  elif [ "$check_status" -ne 0 ]; then
+    echo "q2: update check failed (q2-image exit ${check_status}); skipping." >&2
+  fi
+fi
+
+tty=()
+[ -t 0 ] && tty=(-it)
+
+exec docker run --rm "${tty[@]}" \
+  -v "$PWD":/work -w /work \
+  -u "$(id -u):$(id -g)" \
+  -e HOME=/tmp -e XDG_CACHE_HOME=/tmp \
+  "$IMAGE" "$@"

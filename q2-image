@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+#
+# Build / update / manage the source-built `q2` Docker image.
+#
+# The image bakes a `q2` binary compiled from quarto-dev/q2. The source is
+# fetched inside the Docker build, so the host needs only Docker and git.
+# Rebuilds are incremental thanks to BuildKit cargo/target cache mounts.
+set -euo pipefail
+
+# Resolve the symlink chain so the Dockerfile path stays anchored to the real
+# script location rather than to a link that points at it.
+source_path="${BASH_SOURCE[0]}"
+while [ -L "$source_path" ]; do
+  link_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+  source_path="$(readlink "$source_path")"
+  [ "${source_path#/}" = "$source_path" ] && source_path="$link_dir/$source_path"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$source_path")" && pwd)"
+REPO_URL="${Q2_REPO_URL:-https://github.com/quarto-dev/q2}"
+IMAGE_REPO="${Q2_IMAGE_REPO:-quarto-dev/q2}"
+UPDATE_CHECK_TTL="${Q2_UPDATE_CHECK_TTL:-86400}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/q2-container"
+
+export DOCKER_BUILDKIT=1
+
+die() {
+  echo "q2-image: $*" >&2
+  exit 1
+}
+
+# The ref to build: Q2_REF when set, otherwise the newest upstream v* tag.
+resolve_ref() {
+  if [ -n "${Q2_REF:-}" ]; then
+    echo "$Q2_REF"
+    return 0
+  fi
+  local tag
+  tag="$(git ls-remote --tags --refs "$REPO_URL" 'v*' 2>/dev/null |
+    sed 's|.*refs/tags/||' | sort -V | tail -1)"
+  [ -n "$tag" ] || return 1
+  echo "$tag"
+}
+
+# The commit a ref points at. The peeled "^{}" entry is preferred so that an
+# annotated tag yields its commit rather than the tag object.
+resolve_rev() {
+  local ref="$1" refs rev
+  if [ "${#ref}" -eq 40 ] && [ -z "${ref//[0-9a-f]/}" ]; then
+    echo "$ref"
+    return 0
+  fi
+  refs="$(git ls-remote "$REPO_URL" \
+    "refs/tags/${ref}^{}" "refs/tags/${ref}" "refs/heads/${ref}" 2>/dev/null)" || return 1
+  rev="$(printf '%s\n' "$refs" | grep -m1 '\^{}$' | cut -f1 || true)"
+  [ -n "$rev" ] || rev="$(printf '%s\n' "$refs" | head -1 | cut -f1)"
+  [ -n "$rev" ] || return 1
+  echo "$rev"
+}
+
+# "<ref> <commit>" for the source that a build would use.
+resolve_source() {
+  local ref rev
+  ref="$(resolve_ref)" || return 1
+  rev="$(resolve_rev "$ref")" || return 1
+  printf '%s %s\n' "$ref" "$rev"
+}
+
+# Keyed on repository as well as ref, so a fork never reuses upstream's answer.
+source_cache_file() {
+  local key
+  key="$(printf '%s#%s' "$REPO_URL" "${Q2_REF:-@latest}" | tr -c 'A-Za-z0-9._-' '_')"
+  printf '%s/%s.rev' "$CACHE_DIR" "$key"
+}
+
+# resolve_source with a TTL, so the wrapper's staleness check does not hit the
+# network on every invocation.
+cached_source() {
+  local file src
+  file="$(source_cache_file)"
+  if [ "$UPDATE_CHECK_TTL" -gt 0 ] && [ -f "$file" ] &&
+    [ -z "$(find "$file" -mmin "+$((UPDATE_CHECK_TTL / 60))" 2>/dev/null)" ]; then
+    cat "$file"
+    return 0
+  fi
+  src="$(resolve_source)" || return 1
+  write_source_cache "$src"
+  printf '%s\n' "$src"
+}
+
+write_source_cache() {
+  mkdir -p "$CACHE_DIR"
+  printf '%s\n' "$1" >"$(source_cache_file)"
+}
+
+# The image tag a ref maps to: the version for a v* tag, else a short commit.
+image_tag() {
+  local ref="$1" rev="$2"
+  case "$ref" in
+    v[0-9]*) echo "${ref#v}" ;;
+    *) echo "${rev:0:12}" ;;
+  esac
+}
+
+# The source-rev label baked into an image (empty if the image is absent).
+baked_rev() {
+  docker image inspect \
+    --format '{{ index .Config.Labels "org.quarto.q2.source-rev" }}' \
+    "${1:-$IMAGE_REPO:latest}" 2>/dev/null || true
+}
+
+cmd_build() {
+  local src ref rev tag
+  src="$(resolve_source)" || die "cannot resolve a ref at ${REPO_URL} (set Q2_REF, or check the network)"
+  read -r ref rev <<<"$src"
+  write_source_cache "$src"
+  tag="$(image_tag "$ref" "$rev")"
+  echo "Building ${IMAGE_REPO}:${tag} (and :latest) from ${REPO_URL} at ${ref}"
+  docker build \
+    --build-arg "Q2_REPO_URL=${REPO_URL}" \
+    --build-arg "Q2_REF=${ref}" \
+    --build-arg "Q2_SOURCE_REV=${rev}" \
+    -t "${IMAGE_REPO}:${tag}" \
+    -t "${IMAGE_REPO}:latest" \
+    - <"$SCRIPT_DIR/Dockerfile"
+  echo "Done: ${IMAGE_REPO}:${tag} (source-rev ${rev})"
+}
+
+# Exit 0 if the image matches upstream, 3 if stale/absent, 4 if unreachable.
+# --quiet suppresses the human-readable line (used by the q2 wrapper).
+cmd_check() {
+  local quiet=0
+  [ "${1:-}" = --quiet ] && {
+    quiet=1
+    shift
+  }
+  local image="${1:-${Q2_IMAGE:-$IMAGE_REPO:latest}}"
+  local src ref rev baked
+  baked="$(baked_rev "$image")"
+  if [ -z "$baked" ]; then
+    [ "$quiet" -eq 1 ] || echo "no image ${image} built yet"
+    return 3
+  fi
+  if ! src="$(cached_source)"; then
+    [ "$quiet" -eq 1 ] || echo "cannot reach ${REPO_URL}"
+    return 4
+  fi
+  read -r ref rev <<<"$src"
+  if [ "$rev" = "$baked" ]; then
+    [ "$quiet" -eq 1 ] || echo "up to date (${ref} ${rev})"
+    return 0
+  fi
+  [ "$quiet" -eq 1 ] || echo "stale: ${ref} is ${rev}, image has ${baked}"
+  return 3
+}
+
+cmd_version() {
+  local src ref rev
+  src="$(resolve_source)" || die "cannot resolve a ref at ${REPO_URL} (set Q2_REF, or check the network)"
+  read -r ref rev <<<"$src"
+  echo "${IMAGE_REPO}:$(image_tag "$ref" "$rev")"
+}
+
+cmd_shell() {
+  exec docker run --rm -it \
+    -v "$PWD":/work -w /work \
+    --entrypoint bash \
+    "${IMAGE_REPO}:latest"
+}
+
+cmd_install() {
+  local dest="${1:-$HOME/.local/bin}"
+  mkdir -p "$dest"
+  ln -sf "$SCRIPT_DIR/q2" "$dest/q2"
+  echo "Linked $dest/q2 -> $SCRIPT_DIR/q2"
+  case ":$PATH:" in
+    *":$dest:"*) ;;
+    *) echo "Note: $dest is not on your PATH." ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+Usage: q2-image <command>
+
+  build, update   Build/rebuild the image from quarto-dev/q2 (tags :<version> and :latest).
+  check [IMAGE]   Exit 0 if the image matches upstream, 3 if stale/absent, 4 if unreachable.
+  version         Print the image tag that would be built (queries the remote).
+  shell           Open a shell in the image (cwd mounted at /work).
+  install [DIR]   Symlink the q2 wrapper into DIR (default: ~/.local/bin).
+
+Environment:
+  Q2_REPO_URL           q2 source repository (default: https://github.com/quarto-dev/q2).
+  Q2_REF                Branch, tag, or commit to build (default: newest v* tag).
+  Q2_IMAGE_REPO         Image repository name (default: quarto-dev/q2).
+  Q2_UPDATE_CHECK_TTL   Seconds to cache the remote lookup used by check (default: 86400).
+EOF
+}
+
+case "${1:-}" in
+  build | update) cmd_build ;;
+  check)
+    shift
+    cmd_check "$@"
+    ;;
+  version) cmd_version ;;
+  shell) cmd_shell ;;
+  install)
+    shift
+    cmd_install "$@"
+    ;;
+  "" | -h | --help | help) usage ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
