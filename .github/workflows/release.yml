@@ -1,0 +1,286 @@
+# @license MIT
+# @copyright 2026 Mickaël Canouil
+# @author Mickaël Canouil
+
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Two runs at once would resolve the same version and race over the bump
+# branch. Queue rather than cancel: a cancelled run leaves the branch and its
+# pull request behind.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      BRANCH: ci/bump-version
+      COMMIT: "ci: bump version for release :rocket:"
+
+    steps:
+      - name: Refuse to release from anything but the default branch
+        if: ${{ github.ref_name != github.event.repository.default_branch }}
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          echo "::error::Releases are cut from ${DEFAULT_BRANCH}, not ${REF_NAME}."
+          exit 1
+
+      # The default branch requires a pull request, and a push made with the
+      # default GITHUB_TOKEN triggers no workflow, so the bump is pushed as the
+      # App instead.
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_KEY }}
+
+      - name: Get GitHub App user id
+        id: get-user-id
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          echo "user-id=${USER_ID}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          # Every tag, since the same-day suffix is resolved from the tags
+          # already cut.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure Git user
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          USER_ID: ${{ steps.get-user-id.outputs.user-id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Resolve the version to cut
+        id: resolve-version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DATE=$(date +%Y-%m-%d)
+          BASE="${DATE//-/.}"
+          VERSION="${BASE}"
+          TITLE="${DATE}"
+
+          # The first release of a day is the bare date; every further one
+          # carries the count of releases cut that day.
+          SUFFIX=1
+          while [ -n "$(git tag --list "${VERSION}")" ]; do
+            SUFFIX=$((SUFFIX + 1))
+            VERSION="${BASE}-${SUFFIX}"
+            TITLE="${DATE} (${SUFFIX})"
+          done
+
+          echo "Cutting ${VERSION}, titled ${TITLE}."
+          {
+            echo "version=${VERSION}"
+            echo "title=${TITLE}"
+            echo "date=${DATE}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Bump the version
+        id: bump-version
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.resolve-version.outputs.version }}
+          DATE: ${{ steps.resolve-version.outputs.date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A run that died between creating the pull request and merging it
+          # leaves both the branch and an open pull request behind. The branch is
+          # force-pushed below, but an open pull request would make `gh pr create`
+          # fail, so it is closed first.
+          if git ls-remote --exit-code --heads origin "${BRANCH}" > /dev/null 2>&1; then
+            echo "Remote branch ${BRANCH} already exists; it will be force-pushed."
+            STALE_PR=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')
+            if [ -n "${STALE_PR}" ]; then
+              echo "Closing the stale pull request #${STALE_PR}."
+              gh pr close "${STALE_PR}"
+            fi
+          fi
+          git checkout -B "${BRANCH}"
+
+          sed -i "s/^version:.*/version: \"${VERSION}\"/" CITATION.cff
+          sed -i "s/^date-released:.*/date-released: \"${DATE}\"/" CITATION.cff
+          git add CITATION.cff
+
+          # The unreleased section becomes the released one, and a fresh
+          # unreleased heading takes its place. An empty section is left alone:
+          # rolling it would produce a release heading with nothing under it.
+          RELEASE_NOTES=$(awk '/^## \[Unreleased\]/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md | sed '/./,$!d')
+          if [ -n "${RELEASE_NOTES}" ]; then
+            sed -i "s/^## \[Unreleased\]$/## [Unreleased]\n\n## ${VERSION} (${DATE})/" CHANGELOG.md
+            git add CHANGELOG.md
+          fi
+
+          if git diff --cached --quiet; then
+            echo "::error::Nothing to bump: CITATION.cff already records ${VERSION} released on ${DATE}."
+            exit 1
+          fi
+
+          git commit -m "${COMMIT}"
+          git push --force origin "${BRANCH}"
+
+          sleep 5
+          # gh prints the pull request URL as the last line of its output.
+          PR_URL=$(gh pr create \
+            --fill-first \
+            --base "${GITHUB_REF_NAME}" \
+            --head "${BRANCH}" \
+            --label "Type: CI/CD :robot:" | tail -n 1)
+          echo "Pull request: ${PR_URL}"
+
+          echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+          if [ -n "${RELEASE_NOTES}" ]; then
+            # A changelog is free to contain any fixed delimiter we might pick,
+            # and a line matching it would end the value early.
+            DELIM="RELEASE_NOTES_$(openssl rand -hex 16)"
+            {
+              echo "release_notes<<${DELIM}"
+              echo "${RELEASE_NOTES}"
+              echo "${DELIM}"
+            } >> "${GITHUB_OUTPUT}"
+          fi
+
+      # The default branch requires a pull request but no reviews and no status
+      # checks, so the bump is mergeable as soon as GitHub has computed
+      # mergeability. `--auto` is not used: enabling auto-merge on a pull
+      # request that nothing blocks fails with "Pull request is in clean
+      # status".
+      - name: Merge the version bump
+        id: merge-version
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_URL: ${{ steps.bump-version.outputs.pr_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MERGEABLE="UNKNOWN"
+          DEADLINE=$(( SECONDS + 120 ))
+          while [ "${SECONDS}" -lt "${DEADLINE}" ]; do
+            MERGEABLE=$(gh pr view "${PR_URL}" --json mergeable --jq '.mergeable')
+            if [ "${MERGEABLE}" != "UNKNOWN" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "${MERGEABLE}" != "MERGEABLE" ]; then
+            echo "::error::${PR_URL} is ${MERGEABLE}; the version bump cannot be merged."
+            exit 1
+          fi
+
+          gh pr merge "${PR_URL}" --squash --delete-branch
+
+          # The tag points at the merged bump rather than at whatever the
+          # default branch pointed at when this run started, so the release and
+          # the recorded version describe one commit. The merge commit is not
+          # always attached the moment the merge returns.
+          MERGE_SHA=""
+          DEADLINE=$(( SECONDS + 120 ))
+          while [ "${SECONDS}" -lt "${DEADLINE}" ]; do
+            MERGE_SHA=$(gh pr view "${PR_URL}" --json mergeCommit --jq '.mergeCommit.oid // ""')
+            if [ -n "${MERGE_SHA}" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "${MERGE_SHA}" ]; then
+            echo "::error::${PR_URL} merged but reported no merge commit."
+            exit 1
+          fi
+
+          echo "Merged as ${MERGE_SHA}."
+          echo "merge_sha=${MERGE_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Release on GitHub
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.resolve-version.outputs.version }}
+          TITLE: ${{ steps.resolve-version.outputs.title }}
+          RELEASE_NOTES: ${{ steps.bump-version.outputs.release_notes }}
+          MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Composed here rather than through `--generate-notes`, so the
+          # changelog entry comes first and the generated commit and pull
+          # request list follows it.
+          AUTO_NOTES=$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            --method POST \
+            -f tag_name="${VERSION}" \
+            -f target_commitish="${MERGE_SHA}" \
+            --jq '.body' 2> /dev/null) || AUTO_NOTES=""
+
+          {
+            if [ -n "${RELEASE_NOTES}" ]; then
+              echo "## Changelog"
+              echo ""
+              echo "${RELEASE_NOTES}"
+              echo ""
+            fi
+            if [ -n "${AUTO_NOTES}" ]; then
+              echo "${AUTO_NOTES}"
+            fi
+          } > release_notes.md
+
+          # `gh release create` cuts the tag itself from `--target`.
+          gh release create "${VERSION}" \
+            --target "${MERGE_SHA}" \
+            --title "${TITLE}" \
+            --notes-file release_notes.md \
+            --latest
+
+      - name: Add release summary
+        env:
+          VERSION: ${{ steps.resolve-version.outputs.version }}
+          TITLE: ${{ steps.resolve-version.outputs.title }}
+          DATE: ${{ steps.resolve-version.outputs.date }}
+          MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Release"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|--------|"
+            echo "| Tag | \`${VERSION}\` |"
+            echo "| Title | \`${TITLE}\` |"
+            echo "| Date | \`${DATE}\` |"
+            echo "| Commit | \`${MERGE_SHA}\` |"
+            echo ""
+            echo "[Release notes](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${VERSION})"
+          } >> "${GITHUB_STEP_SUMMARY}"
