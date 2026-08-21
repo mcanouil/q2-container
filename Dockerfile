@@ -43,11 +43,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/q2 /usr/local/bin/q2
 
 FROM ${RUNTIME_IMAGE} AS runtime
-# vendored-openssl means no runtime libssl dependency; only TLS roots are needed.
+# vendored-openssl means no runtime libssl dependency, so TLS roots would be
+# enough for q2 itself. curl and git are here for the project's own pre-render
+# and post-render scripts, which are ordinary shell scripts and assume them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/q2 /usr/local/bin/q2
+# Project scripts call `quarto`, not `q2`.
+RUN ln -s q2 /usr/local/bin/quarto
 # Upstream commit baked in so the host wrapper can detect a stale image and
 # offer to rebuild. ARGs do not cross stages, hence the redeclaration.
 ARG Q2_SOURCE_REV

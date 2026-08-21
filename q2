@@ -43,8 +43,54 @@ fi
 tty=()
 [ -t 0 ] && tty=(-it)
 
+# The directory to bind-mount for a path argument: the Quarto project that
+# holds it, so a file names its whole project rather than itself alone;
+# otherwise the directory the path sits in. Mounting the file alone would leave
+# Docker to create the parent chain as root, and the render then cannot write
+# `.quarto` or the output directory next to the file. The walk stops at $HOME
+# and at the root of the filesystem, so a stray file never mounts either.
+mount_root() {
+  local path="$1" dir probe
+  if [ -d "$path" ]; then
+    dir="$path"
+  else
+    dir="$(dirname "$path")"
+  fi
+  probe="$dir"
+  while [ "$probe" != "/" ] && [ "$probe" != "$HOME" ]; do
+    if [ -f "$probe/_quarto.yml" ] || [ -f "$probe/_quarto.yaml" ]; then
+      echo "$probe"
+      return 0
+    fi
+    probe="$(dirname "$probe")"
+  done
+  echo "$dir"
+}
+
+# The current directory is always /work. An argument that names an existing
+# host path outside it brings its project in, mounted at its own absolute path,
+# so the argument reaches q2 unchanged and resolves to the same file inside the
+# container. Arguments that are not paths (flags, formats, KEY:VALUE pairs) are
+# ignored, and each directory is mounted once however many arguments name it.
+cwd="$(pwd -P)"
+mounts=(-v "$cwd":/work)
+mounted=""
+for arg in "$@"; do
+  [ -e "$arg" ] || continue
+  real="$(cd -P "$(dirname "$arg")" && pwd)/$(basename "$arg")"
+  root="$(mount_root "$real")"
+  case "$root" in
+    "$cwd" | "$cwd"/*) continue ;;
+  esac
+  case ":$mounted:" in
+    *":$root:"*) continue ;;
+  esac
+  mounted="$mounted:$root"
+  mounts+=(-v "$root":"$root")
+done
+
 exec docker run --rm "${tty[@]}" \
-  -v "$PWD":/work -w /work \
+  "${mounts[@]}" -w /work \
   -u "$(id -u):$(id -g)" \
   -e HOME=/tmp -e XDG_CACHE_HOME=/tmp \
   "$IMAGE" "$@"

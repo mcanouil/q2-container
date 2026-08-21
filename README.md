@@ -53,10 +53,19 @@ Then, from any directory:
 ```bash
 q2 --version
 q2 render doc.qmd           # reads/writes host files in the current directory
+q2 render ~/sites/blog      # renders a project somewhere else
 ```
 
 The current directory is bind-mounted at `/work` and commands run as your
 uid/gid, so generated files are owned by you, not root.
+
+An argument that names an existing path outside the current directory is
+mounted too, at its own absolute path, so the argument reaches `q2` unchanged.
+For a file, the mount is the Quarto project that holds it, found by walking up
+to the nearest `_quarto.yml`; a file with no project above it brings in its own
+directory. The walk stops at your home directory and at the root of the
+filesystem, so neither is ever mounted. Arguments that are not paths, such as
+flags and `KEY:VALUE` pairs, are left alone.
 
 ## Update when upstream q2 moves
 
@@ -108,6 +117,14 @@ prompt).
   does not shell out to it. If you hit a command that needs a system `pandoc`,
   add `pandoc` to the runtime stage's `apt-get install` line in the
   `Dockerfile` and rebuild.
+- **Scripts get a small toolbox.** Pre-render and post-render scripts run
+  inside the container, where `bash`, `curl`, `git`, `sed`, and `tar` are
+  available. A script that needs anything else fails with status 127; add the
+  package to the runtime stage's `apt-get install` line and rebuild.
+- **`quarto` is a symlink to `q2`**, because project scripts call `quarto`.
+- **There is no Typst engine.** The image ships no `typst` binary, and
+  `q2 typst` is not implemented upstream. A project whose scripts or filters
+  need Typst does not render.
 
 ## Licence
 
