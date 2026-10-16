@@ -209,7 +209,6 @@ jobs:
           echo "title=${TITLE}" >> "${GITHUB_OUTPUT}"
 
       - name: Release on GitHub
-        id: release
         uses: mcanouil/release-actions/release@v1
         with:
           version: ${{ steps.bump.outputs.version }}
@@ -219,25 +218,3 @@ jobs:
           latest: true
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Add release summary
-        env:
-          VERSION: ${{ steps.bump.outputs.version }}
-          TITLE: ${{ steps.title.outputs.title }}
-          DATE: ${{ steps.bump.outputs.date }}
-          MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
-          URL: ${{ steps.release.outputs.url }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "## Release"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|--------|"
-            echo "| Tag | \`${VERSION}\` |"
-            echo "| Title | \`${TITLE}\` |"
-            echo "| Date | \`${DATE}\` |"
-            echo "| Commit | \`${MERGE_SHA}\` |"
-            echo ""
-            echo "[Release notes](${URL})"
-          } >> "${GITHUB_STEP_SUMMARY}"
