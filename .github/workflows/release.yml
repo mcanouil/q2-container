@@ -79,7 +79,8 @@ jobs:
           git config user.email "${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
       # The first release of a day is the bare date; every further one carries
-      # the count of releases cut that day, such as `2026.10.16-2`.
+      # the count of releases cut that day, such as `2026.10.16-2`. An empty
+      # Unreleased section in CHANGELOG.md stops the release here.
       - name: Bump the version
         id: bump
         uses: mcanouil/release-actions/bump@v1
@@ -91,6 +92,31 @@ jobs:
               pattern: '^version: "{version}"$'
             - file: CITATION.cff
               pattern: '^date-released: "{date}"$'
+
+      # The release step refuses an existing tag too, but only after the merge,
+      # which would leave the bump on the default branch.
+      - name: Refuse an existing tag or release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATUS=0
+          git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null || STATUS=$?
+          case "${STATUS}" in
+            0) echo "::error::Tag ${VERSION} exists already."; exit 1 ;;
+            2) ;;
+            *) echo "::error::Could not list the tags of origin (git exit ${STATUS})."; exit 1 ;;
+          esac
+          if OUTPUT=$(gh release view "${VERSION}" 2>&1); then
+            echo "::error::A release ${VERSION} exists already, perhaps as a draft."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"${OUTPUT}"; then
+            echo "::error::Could not check for release ${VERSION}: ${OUTPUT}"
+            exit 1
+          fi
 
       - name: Open the version bump pull request
         id: bump-pr
@@ -218,3 +244,11 @@ jobs:
           latest: true
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Explain the recovery
+        if: ${{ failure() && steps.merge-version.outputs.merge_sha != '' }}
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
+        shell: bash
+        run: |
+          echo "::error::${GITHUB_REF_NAME} holds the bump ${MERGE_SHA} for ${VERSION}, but the release failed. Create release ${VERSION} on ${MERGE_SHA} by hand, or revert that commit with a pull request and run this workflow again."
