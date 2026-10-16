@@ -78,39 +78,51 @@ jobs:
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
-      - name: Resolve the version to cut
-        id: resolve-version
+      # The first release of a day is the bare date; every further one carries
+      # the count of releases cut that day, such as `2026.10.16-2`. An empty
+      # Unreleased section in CHANGELOG.md stops the release here.
+      - name: Bump the version
+        id: bump
+        uses: mcanouil/release-actions/bump@v1
+        with:
+          bump: calver
+          version-source: tag
+          targets: |
+            - file: CITATION.cff
+              pattern: '^version: "{version}"$'
+            - file: CITATION.cff
+              pattern: '^date-released: "{date}"$'
+
+      # The release step refuses an existing tag too, but only after the merge,
+      # which would leave the bump on the default branch.
+      - name: Refuse an existing tag or release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
+          STATUS=0
+          git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null || STATUS=$?
+          case "${STATUS}" in
+            0) echo "::error::Tag ${VERSION} exists already."; exit 1 ;;
+            2) ;;
+            *) echo "::error::Could not list the tags of origin (git exit ${STATUS})."; exit 1 ;;
+          esac
+          if OUTPUT=$(gh release view "${VERSION}" 2>&1); then
+            echo "::error::A release ${VERSION} exists already, perhaps as a draft."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"${OUTPUT}"; then
+            echo "::error::Could not check for release ${VERSION}: ${OUTPUT}"
+            exit 1
+          fi
 
-          DATE=$(date +%Y-%m-%d)
-          BASE="${DATE//-/.}"
-          VERSION="${BASE}"
-          TITLE="${DATE}"
-
-          # The first release of a day is the bare date; every further one
-          # carries the count of releases cut that day.
-          SUFFIX=1
-          while [ -n "$(git tag --list "${VERSION}")" ]; do
-            SUFFIX=$((SUFFIX + 1))
-            VERSION="${BASE}-${SUFFIX}"
-            TITLE="${DATE} (${SUFFIX})"
-          done
-
-          echo "Cutting ${VERSION}, titled ${TITLE}."
-          {
-            echo "version=${VERSION}"
-            echo "title=${TITLE}"
-            echo "date=${DATE}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Bump the version
-        id: bump-version
+      - name: Open the version bump pull request
+        id: bump-pr
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          VERSION: ${{ steps.resolve-version.outputs.version }}
-          DATE: ${{ steps.resolve-version.outputs.date }}
+          FILES: ${{ steps.bump.outputs.files }}
         shell: bash
         run: |
           set -euo pipefail
@@ -129,24 +141,7 @@ jobs:
           fi
           git checkout -B "${BRANCH}"
 
-          sed -i "s/^version:.*/version: \"${VERSION}\"/" CITATION.cff
-          sed -i "s/^date-released:.*/date-released: \"${DATE}\"/" CITATION.cff
-          git add CITATION.cff
-
-          # The unreleased section becomes the released one, and a fresh
-          # unreleased heading takes its place. An empty section is left alone:
-          # rolling it would produce a release heading with nothing under it.
-          RELEASE_NOTES=$(awk '/^## \[Unreleased\]/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md | sed '/./,$!d')
-          if [ -n "${RELEASE_NOTES}" ]; then
-            sed -i "s/^## \[Unreleased\]$/## [Unreleased]\n\n## ${VERSION} (${DATE})/" CHANGELOG.md
-            git add CHANGELOG.md
-          fi
-
-          if git diff --cached --quiet; then
-            echo "::error::Nothing to bump: CITATION.cff already records ${VERSION} released on ${DATE}."
-            exit 1
-          fi
-
+          printf '%s\n' "${FILES}" | git add --pathspec-from-file=-
           git commit -m "${COMMIT}"
           git push --force origin "${BRANCH}"
 
@@ -158,18 +153,7 @@ jobs:
             --head "${BRANCH}" \
             --label "Type: CI/CD :robot:" | tail -n 1)
           echo "Pull request: ${PR_URL}"
-
           echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
-          if [ -n "${RELEASE_NOTES}" ]; then
-            # A changelog is free to contain any fixed delimiter we might pick,
-            # and a line matching it would end the value early.
-            DELIM="RELEASE_NOTES_$(openssl rand -hex 16)"
-            {
-              echo "release_notes<<${DELIM}"
-              echo "${RELEASE_NOTES}"
-              echo "${DELIM}"
-            } >> "${GITHUB_OUTPUT}"
-          fi
 
       # The default branch requires a pull request but no reviews and no status
       # checks, so the bump is mergeable as soon as GitHub has computed
@@ -180,7 +164,7 @@ jobs:
         id: merge-version
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_URL: ${{ steps.bump-version.outputs.pr_url }}
+          PR_URL: ${{ steps.bump-pr.outputs.pr_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -217,70 +201,55 @@ jobs:
           done
 
           if [ -z "${MERGE_SHA}" ]; then
-            echo "::error::${PR_URL} merged but reported no merge commit."
+            echo "::error::${PR_URL} merged but reported no merge commit. ${GITHUB_REF_NAME} holds the bump with no release: create the release by hand on the merge commit, or revert it with a pull request and run this workflow again."
             exit 1
           fi
 
           echo "Merged as ${MERGE_SHA}."
           echo "merge_sha=${MERGE_SHA}" >> "${GITHUB_OUTPUT}"
 
+      - name: Compose the release body
+        id: notes
+        uses: mcanouil/release-actions/notes@v1
+        with:
+          notes-file: ${{ steps.bump.outputs.notes-file }}
+          tag: ${{ steps.bump.outputs.version }}
+          target: ${{ steps.merge-version.outputs.merge_sha }}
+          generate-notes: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      # A further release of a day is titled with its count, such as
+      # `2026-10-16 (2)`.
+      - name: Resolve the release title
+        id: title
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          DATE: ${{ steps.bump.outputs.date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="${DATE}"
+          if [[ "${VERSION}" == *-* ]]; then
+            TITLE="${DATE} (${VERSION##*-})"
+          fi
+          echo "title=${TITLE}" >> "${GITHUB_OUTPUT}"
+
       - name: Release on GitHub
+        uses: mcanouil/release-actions/release@v1
+        with:
+          version: ${{ steps.bump.outputs.version }}
+          body-file: ${{ steps.notes.outputs.body-file }}
+          title: ${{ steps.title.outputs.title }}
+          target: ${{ steps.merge-version.outputs.merge_sha }}
+          latest: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Explain the recovery
+        if: ${{ failure() && steps.merge-version.outputs.merge_sha != '' }}
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          VERSION: ${{ steps.resolve-version.outputs.version }}
-          TITLE: ${{ steps.resolve-version.outputs.title }}
-          RELEASE_NOTES: ${{ steps.bump-version.outputs.release_notes }}
+          VERSION: ${{ steps.bump.outputs.version }}
           MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # Composed here rather than through `--generate-notes`, so the
-          # changelog entry comes first and the generated commit and pull
-          # request list follows it.
-          AUTO_NOTES=$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-            --method POST \
-            -f tag_name="${VERSION}" \
-            -f target_commitish="${MERGE_SHA}" \
-            --jq '.body' 2> /dev/null) || AUTO_NOTES=""
-
-          {
-            if [ -n "${RELEASE_NOTES}" ]; then
-              echo "## Changelog"
-              echo ""
-              echo "${RELEASE_NOTES}"
-              echo ""
-            fi
-            if [ -n "${AUTO_NOTES}" ]; then
-              echo "${AUTO_NOTES}"
-            fi
-          } > release_notes.md
-
-          # `gh release create` cuts the tag itself from `--target`.
-          gh release create "${VERSION}" \
-            --target "${MERGE_SHA}" \
-            --title "${TITLE}" \
-            --notes-file release_notes.md \
-            --latest
-
-      - name: Add release summary
-        env:
-          VERSION: ${{ steps.resolve-version.outputs.version }}
-          TITLE: ${{ steps.resolve-version.outputs.title }}
-          DATE: ${{ steps.resolve-version.outputs.date }}
-          MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "## Release"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|--------|"
-            echo "| Tag | \`${VERSION}\` |"
-            echo "| Title | \`${TITLE}\` |"
-            echo "| Date | \`${DATE}\` |"
-            echo "| Commit | \`${MERGE_SHA}\` |"
-            echo ""
-            echo "[Release notes](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${VERSION})"
-          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::error::${GITHUB_REF_NAME} holds the bump ${MERGE_SHA} for ${VERSION}, but the release failed. Create release ${VERSION} on ${MERGE_SHA} by hand, or revert that commit with a pull request and run this workflow again."
