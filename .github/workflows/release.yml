@@ -201,7 +201,7 @@ jobs:
           done
 
           if [ -z "${MERGE_SHA}" ]; then
-            echo "::error::${PR_URL} merged but reported no merge commit."
+            echo "::error::${PR_URL} merged but reported no merge commit. ${GITHUB_REF_NAME} holds the bump with no release: create the release by hand on the merge commit, or revert it with a pull request and run this workflow again."
             exit 1
           fi
 
@@ -251,4 +251,5 @@ jobs:
           MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
         shell: bash
         run: |
+          set -euo pipefail
           echo "::error::${GITHUB_REF_NAME} holds the bump ${MERGE_SHA} for ${VERSION}, but the release failed. Create release ${VERSION} on ${MERGE_SHA} by hand, or revert that commit with a pull request and run this workflow again."
