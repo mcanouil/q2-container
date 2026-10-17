@@ -23,10 +23,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    env:
-      BRANCH: ci/bump-version
-      COMMIT: "ci: bump version for release :rocket:"
-
     steps:
       - name: Refuse to release from anything but the default branch
         if: ${{ github.ref_name != github.event.repository.default_branch }}
@@ -41,42 +37,21 @@ jobs:
       # The default branch requires a pull request, and a push made with the
       # default GITHUB_TOKEN triggers no workflow, so the bump is pushed as the
       # App instead.
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v3
+      - name: Get the token
+        id: token
+        uses: mcanouil/release-actions/token@v1
         with:
-          client-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.APP_KEY }}
-
-      - name: Get GitHub App user id
-        id: get-user-id
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
-          echo "user-id=${USER_ID}" >> "${GITHUB_OUTPUT}"
+          app-id: ${{ vars.APP_ID }}
+          app-key: ${{ secrets.APP_KEY }}
 
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.token.outputs.token }}
           # Every tag, since the same-day suffix is resolved from the tags
           # already cut.
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Configure Git user
-        env:
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          USER_ID: ${{ steps.get-user-id.outputs.user-id }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "${APP_SLUG}[bot]"
-          git config user.email "${USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
 
       # The first release of a day is the bare date; every further one carries
       # the count of releases cut that day, such as `2026.10.16-2`. An empty
@@ -87,102 +62,23 @@ jobs:
         with:
           bump: calver
           version-source: tag
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.token.outputs.token }}
           targets: |
             - file: CITATION.cff
               pattern: '^version: "{version}"$'
             - file: CITATION.cff
               pattern: '^date-released: "{date}"$'
 
-      - name: Open the version bump pull request
-        id: bump-pr
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          FILES: ${{ steps.bump.outputs.files }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # A run that died between creating the pull request and merging it
-          # leaves both the branch and an open pull request behind. The branch is
-          # force-pushed below, but an open pull request would make `gh pr create`
-          # fail, so it is closed first.
-          if git ls-remote --exit-code --heads origin "${BRANCH}" > /dev/null 2>&1; then
-            echo "Remote branch ${BRANCH} already exists; it will be force-pushed."
-            STALE_PR=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')
-            if [ -n "${STALE_PR}" ]; then
-              echo "Closing the stale pull request #${STALE_PR}."
-              gh pr close "${STALE_PR}"
-            fi
-          fi
-          git checkout -B "${BRANCH}"
-
-          printf '%s\n' "${FILES}" | git add --pathspec-from-file=-
-          git commit -m "${COMMIT}"
-          git push --force origin "${BRANCH}"
-
-          sleep 5
-          # gh prints the pull request URL as the last line of its output.
-          PR_URL=$(gh pr create \
-            --fill-first \
-            --base "${GITHUB_REF_NAME}" \
-            --head "${BRANCH}" \
-            --label "Type: CI/CD :robot:" | tail -n 1)
-          echo "Pull request: ${PR_URL}"
-          echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
-
-      # The default branch requires a pull request but no reviews and no status
-      # checks, so the bump is mergeable as soon as GitHub has computed
-      # mergeability. `--auto` is not used: enabling auto-merge on a pull
-      # request that nothing blocks fails with "Pull request is in clean
-      # status".
-      - name: Merge the version bump
-        id: merge-version
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_URL: ${{ steps.bump-pr.outputs.pr_url }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          MERGEABLE="UNKNOWN"
-          DEADLINE=$(( SECONDS + 120 ))
-          while [ "${SECONDS}" -lt "${DEADLINE}" ]; do
-            MERGEABLE=$(gh pr view "${PR_URL}" --json mergeable --jq '.mergeable')
-            if [ "${MERGEABLE}" != "UNKNOWN" ]; then
-              break
-            fi
-            sleep 5
-          done
-
-          if [ "${MERGEABLE}" != "MERGEABLE" ]; then
-            echo "::error::${PR_URL} is ${MERGEABLE}; the version bump cannot be merged."
-            exit 1
-          fi
-
-          gh pr merge "${PR_URL}" --squash --delete-branch
-
-          # The tag points at the merged bump rather than at whatever the
-          # default branch pointed at when this run started, so the release and
-          # the recorded version describe one commit. The merge commit is not
-          # always attached the moment the merge returns.
-          MERGE_SHA=""
-          DEADLINE=$(( SECONDS + 120 ))
-          while [ "${SECONDS}" -lt "${DEADLINE}" ]; do
-            MERGE_SHA=$(gh pr view "${PR_URL}" --json mergeCommit --jq '.mergeCommit.oid // ""')
-            if [ -n "${MERGE_SHA}" ]; then
-              break
-            fi
-            sleep 5
-          done
-
-          if [ -z "${MERGE_SHA}" ]; then
-            echo "::error::${PR_URL} merged but reported no merge commit. ${GITHUB_REF_NAME} holds the bump with no release: create the release by hand on the merge commit, or revert it with a pull request and run this workflow again."
-            exit 1
-          fi
-
-          echo "Merged as ${MERGE_SHA}."
-          echo "merge_sha=${MERGE_SHA}" >> "${GITHUB_OUTPUT}"
+      - name: Land the bump
+        id: land
+        uses: mcanouil/release-actions/land@v1
+        with:
+          mode: pull-request
+          files: ${{ steps.bump.outputs.files }}
+          version: ${{ steps.bump.outputs.version }}
+          message: "ci: bump version for release :rocket:"
+          branch: ci/bump-version
+          token: ${{ steps.token.outputs.token }}
 
       - name: Compose the release body
         id: notes
@@ -190,41 +86,27 @@ jobs:
         with:
           notes-file: ${{ steps.bump.outputs.notes-file }}
           tag: ${{ steps.bump.outputs.version }}
-          target: ${{ steps.merge-version.outputs.merge_sha }}
+          target: ${{ steps.land.outputs.sha }}
           generate-notes: true
-          token: ${{ steps.app-token.outputs.token }}
-
-      # A further release of a day is titled with its count, such as
-      # `2026-10-16 (2)`.
-      - name: Resolve the release title
-        id: title
-        env:
-          VERSION: ${{ steps.bump.outputs.version }}
-          DATE: ${{ steps.bump.outputs.date }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TITLE="${DATE}"
-          if [[ "${VERSION}" == *-* ]]; then
-            TITLE="${DATE} (${VERSION##*-})"
-          fi
-          echo "title=${TITLE}" >> "${GITHUB_OUTPUT}"
+          token: ${{ steps.token.outputs.token }}
 
       - name: Release on GitHub
         uses: mcanouil/release-actions/release@v1
         with:
           version: ${{ steps.bump.outputs.version }}
           body-file: ${{ steps.notes.outputs.body-file }}
-          title: ${{ steps.title.outputs.title }}
-          target: ${{ steps.merge-version.outputs.merge_sha }}
+          # A further release of a day is titled with its count, such as
+          # `2026-10-16 (2)`.
+          title: "{date}{count}"
+          target: ${{ steps.land.outputs.sha }}
           latest: true
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.token.outputs.token }}
 
       - name: Explain the recovery
-        if: ${{ failure() && steps.merge-version.outputs.merge_sha != '' }}
+        if: ${{ failure() && steps.land.outputs.sha != '' }}
         env:
           VERSION: ${{ steps.bump.outputs.version }}
-          MERGE_SHA: ${{ steps.merge-version.outputs.merge_sha }}
+          MERGE_SHA: ${{ steps.land.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
