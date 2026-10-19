@@ -53,11 +53,7 @@ jobs:
           bump: calver
           version-source: tag
           token: ${{ steps.token.outputs.token }}
-          targets: |
-            - file: CITATION.cff
-              pattern: '^version: "{version}"$'
-            - file: CITATION.cff
-              pattern: '^date-released: "{date}"$'
+          ecosystems: citation
 
       - name: Land the bump
         id: land
